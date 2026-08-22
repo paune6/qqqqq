@@ -16,7 +16,7 @@ from aiogram.types import (
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # ===================== КОНФИГУРАЦИЯ =====================
-BOT_TOKEN = "8957553402:AAEZrm6gOIuwcHsqYzsxJ0Drpgw425Bwosw"  # Замените на реальный токен
+BOT_TOKEN = "8643729424:AAEteJA_JHSm_H0T5r6UyJY3kI9hFhVUuxo"  # Замените на реальный токен
 ADMIN_IDS = [5078387190, 119715930]  # ID администраторов (Telegram user IDs)
 
 # Цены на вирты
