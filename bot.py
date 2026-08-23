@@ -15,27 +15,22 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-# ===================== КОНФИГУРАЦИЯ =====================
-BOT_TOKEN = "8643729424:AAEteJA_JHSm_H0T5r6UyJY3kI9hFhVUuxo"  # Замените на реальный токен
-ADMIN_IDS = [5078387190, 119715930]  # ID администраторов (Telegram user IDs)
+BOT_TOKEN = "8643729424:AAEteJA_JHSm_H0T5r6UyJY3kI9hFhVUuxo"
+ADMIN_IDS = [5078387190, 119715930]
 
-# Цены на вирты
-BUY_PRICE = 25   # Покупка у бота
-SELL_PRICE = 20  # Продажа боту
+BUY_PRICE = 25
+SELL_PRICE = 20
 
-# ===================== НАСТРОЙКА ЛОГИРОВАНИЯ =====================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
-# ===================== ИНИЦИАЛИЗАЦИЯ =====================
 storage = MemoryStorage()
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=storage)
 
-# ===================== БАЗА ДАННЫХ =====================
 DB_NAME = "orders.db"
 
 def init_db():
@@ -57,6 +52,20 @@ def init_db():
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS banned_users (
+            user_id INTEGER PRIMARY KEY,
+            banned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            reason TEXT
+        )
+    """)
+    cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('maintenance', '0')")
     conn.commit()
     conn.close()
     logger.info("База данных инициализирована")
@@ -127,7 +136,33 @@ def get_all_orders(limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
                "amount", "total_price", "status", "comment", "created_at", "updated_at"]
     return [dict(zip(columns, row)) for row in rows]
 
-# ===================== СОСТОЯНИЯ FSM =====================
+def get_setting(key: str) -> Optional[str]:
+    rows = db_execute("SELECT value FROM settings WHERE key = ?", (key,))
+    return rows[0][0] if rows else None
+
+def set_setting(key: str, value: str):
+    db_execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
+
+def is_maintenance_on() -> bool:
+    return get_setting("maintenance") == "1"
+
+def toggle_maintenance(state: bool):
+    set_setting("maintenance", "1" if state else "0")
+
+def ban_user(user_id: int, reason: str = ""):
+    db_execute("INSERT OR REPLACE INTO banned_users (user_id, reason) VALUES (?, ?)", (user_id, reason))
+
+def unban_user(user_id: int):
+    db_execute("DELETE FROM banned_users WHERE user_id = ?", (user_id,))
+
+def is_user_banned(user_id: int) -> bool:
+    rows = db_execute("SELECT 1 FROM banned_users WHERE user_id = ?", (user_id,))
+    return bool(rows)
+
+def get_banned_users() -> List[Dict[str, Any]]:
+    rows = db_execute("SELECT user_id, banned_at, reason FROM banned_users ORDER BY banned_at DESC")
+    return [{"user_id": r[0], "banned_at": r[1], "reason": r[2] or ""} for r in rows]
+
 class OrderStates(StatesGroup):
     choosing_type = State()
     entering_server = State()
@@ -141,14 +176,12 @@ class AdminStates(StatesGroup):
     entering_reject_reason = State()
     entering_message_to_user = State()
 
-# ===================== БЕЗОПАСНЫЙ ОТВЕТ НА CALLBACK =====================
 async def safe_answer(callback: CallbackQuery, text: str = None, show_alert: bool = False):
     try:
         await callback.answer(text=text, show_alert=show_alert)
     except Exception as e:
         logger.warning(f"Не удалось ответить на callback (id={callback.id}): {e}")
 
-# ===================== КЛАВИАТУРЫ =====================
 def main_menu_keyboard():
     builder = InlineKeyboardBuilder()
     builder.row(
@@ -188,6 +221,10 @@ def admin_main_keyboard():
     builder.row(
         InlineKeyboardButton(text="📊 Все заявки", callback_data="admin_all"),
         InlineKeyboardButton(text="🚪 Выйти", callback_data="admin_exit")
+    )
+    builder.row(
+        InlineKeyboardButton(text="🔧 Техработы (вкл/выкл)", callback_data="admin_toggle_maintenance"),
+        InlineKeyboardButton(text="❌ Отменить все pending", callback_data="admin_cancel_all")
     )
     return builder.as_markup()
 
@@ -264,7 +301,6 @@ def admin_orders_keyboard(orders: List[Dict[str, Any]], status_filter: str, page
     builder.row(InlineKeyboardButton(text="🔙 В главное меню", callback_data="admin_main"))
     return builder.as_markup()
 
-# ===================== ВСПОМОГАТЕЛЬНЫЕ =====================
 def format_order_info(order: Dict[str, Any]) -> str:
     type_text = "Покупка" if order["order_type"] == "buy" else "Продажа"
     status_map = {
@@ -290,7 +326,6 @@ def format_order_info(order: Dict[str, Any]) -> str:
         lines.append(f"💬 Комментарий: {order['comment']}")
     return "\n".join(lines)
 
-# ===================== ХЕНДЛЕРЫ ПОЛЬЗОВАТЕЛЯ =====================
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     await message.answer(
@@ -324,6 +359,12 @@ async def cmd_cancel(message: Message, state: FSMContext):
 
 @dp.message(Command("new_order"))
 async def cmd_new_order(message: Message, state: FSMContext):
+    if is_user_banned(message.from_user.id):
+        await message.answer("⛔ Вы забанены и не можете создавать заявки.")
+        return
+    if is_maintenance_on():
+        await message.answer("🔧 В настоящее время ведутся технические работы. Приём заявок временно закрыт.")
+        return
     await state.clear()
     await state.set_state(OrderStates.choosing_type)
     await message.answer(
@@ -334,6 +375,12 @@ async def cmd_new_order(message: Message, state: FSMContext):
 @dp.callback_query(F.data == "new_order")
 async def callback_new_order(callback: CallbackQuery, state: FSMContext):
     await safe_answer(callback)
+    if is_user_banned(callback.from_user.id):
+        await callback.message.edit_text("⛔ Вы забанены и не можете создавать заявки.", reply_markup=main_menu_keyboard())
+        return
+    if is_maintenance_on():
+        await callback.message.edit_text("🔧 В настоящее время ведутся технические работы. Приём заявок временно закрыт.", reply_markup=main_menu_keyboard())
+        return
     await cmd_new_order(callback.message, state)
 
 @dp.callback_query(F.data == "my_orders")
@@ -507,7 +554,6 @@ async def view_user_order(callback: CallbackQuery):
         )
     )
 
-# ===================== ХЕНДЛЕРЫ АДМИНА =====================
 @dp.message(Command("admin"))
 async def cmd_admin(message: Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS:
@@ -521,6 +567,130 @@ async def cmd_admin(message: Message, state: FSMContext):
         reply_markup=admin_main_keyboard(),
         parse_mode="Markdown"
     )
+
+@dp.message(Command("ahelp"))
+async def cmd_ahelp(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    text = (
+        "📖 **Список команд администратора**\n\n"
+        "/ahelp - показать эту справку\n"
+        "/ban @username [причина] - заблокировать пользователя\n"
+        "/unban @username - разблокировать пользователя\n"
+        "/maintenance on|off - включить/выключить техработы\n"
+        "/cancel_all - отменить все заявки в статусе pending\n"
+        "/admin - открыть админ-панель"
+    )
+    await message.answer(text, parse_mode="Markdown")
+
+@dp.message(Command("ban"))
+async def cmd_ban(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    args = message.text.split(maxsplit=2)
+    if len(args) < 2:
+        await message.answer("❌ Укажите пользователя: /ban @username [причина]")
+        return
+    username = args[1].lstrip("@")
+    reason = args[2] if len(args) > 2 else "Без причины"
+    try:
+        user = await bot.get_chat(username)
+        user_id = user.id
+    except Exception:
+        if args[1].isdigit():
+            user_id = int(args[1])
+        else:
+            await message.answer("❌ Пользователь не найден. Укажите корректный @username или ID.")
+            return
+    ban_user(user_id, reason)
+    await message.answer(f"✅ Пользователь {args[1]} забанен. Причина: {reason}")
+    try:
+        await bot.send_message(user_id, f"⛔ Вы были забанены администратором. Причина: {reason}")
+    except:
+        pass
+
+@dp.message(Command("unban"))
+async def cmd_unban(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer("❌ Укажите пользователя: /unban @username")
+        return
+    username = args[1].lstrip("@")
+    try:
+        user = await bot.get_chat(username)
+        user_id = user.id
+    except:
+        if args[1].isdigit():
+            user_id = int(args[1])
+        else:
+            await message.answer("❌ Пользователь не найден.")
+            return
+    unban_user(user_id)
+    await message.answer(f"✅ Пользователь {args[1]} разбанен.")
+    try:
+        await bot.send_message(user_id, "✅ Вы были разбанены администратором.")
+    except:
+        pass
+
+@dp.message(Command("maintenance"))
+async def cmd_maintenance(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    args = message.text.split()
+    if len(args) < 2 or args[1].lower() not in ("on", "off"):
+        await message.answer("❌ Использование: /maintenance on|off")
+        return
+    state = args[1].lower() == "on"
+    toggle_maintenance(state)
+    status = "включён" if state else "выключен"
+    await message.answer(f"🔧 Режим технических работ {status}.")
+
+@dp.message(Command("cancel_all"))
+async def cmd_cancel_all(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        InlineKeyboardButton(text="✅ Да, отменить все", callback_data="cancel_all_confirm"),
+        InlineKeyboardButton(text="❌ Нет", callback_data="cancel_all_cancel")
+    )
+    await message.answer(
+        "⚠️ Вы уверены, что хотите отменить все заявки со статусом 'pending'?\nЭто действие необратимо.",
+        reply_markup=kb.as_markup()
+    )
+
+@dp.callback_query(F.data == "cancel_all_confirm")
+async def cancel_all_confirm(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await safe_answer(callback, "⛔ Нет прав")
+        return
+    await safe_answer(callback)
+    pending = get_orders_by_status("pending")
+    if not pending:
+        await callback.message.edit_text("📭 Нет заявок в статусе pending.")
+        return
+    count = 0
+    for order in pending:
+        update_order_status(order["id"], "rejected", "Отменено администратором")
+        try:
+            await bot.send_message(
+                order["user_id"],
+                f"❌ Ваша заявка #{order['id']} была отменена администратором.\nПричина: массовая отмена."
+            )
+        except:
+            pass
+        count += 1
+    await callback.message.edit_text(f"✅ Отменено {count} заявок.", reply_markup=admin_main_keyboard())
+
+@dp.callback_query(F.data == "cancel_all_cancel")
+async def cancel_all_cancel(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await safe_answer(callback, "⛔ Нет прав")
+        return
+    await safe_answer(callback)
+    await callback.message.edit_text("❌ Отмена действия.", reply_markup=admin_main_keyboard())
 
 @dp.callback_query(F.data == "admin_exit")
 async def admin_exit(callback: CallbackQuery, state: FSMContext):
@@ -692,6 +862,36 @@ async def admin_callback_router(callback: CallbackQuery, state: FSMContext):
         )
         return
 
+    if data == "admin_toggle_maintenance":
+        if callback.from_user.id not in ADMIN_IDS:
+            await safe_answer(callback, "⛔ Нет прав")
+            return
+        new_state = not is_maintenance_on()
+        toggle_maintenance(new_state)
+        status = "включён" if new_state else "выключен"
+        await safe_answer(callback, f"Режим техработ {status}")
+        await callback.message.edit_text(
+            f"🔧 Техработы {status}.",
+            reply_markup=admin_main_keyboard()
+        )
+        return
+
+    if data == "admin_cancel_all":
+        if callback.from_user.id not in ADMIN_IDS:
+            await safe_answer(callback, "⛔ Нет прав")
+            return
+        await safe_answer(callback)
+        kb = InlineKeyboardBuilder()
+        kb.row(
+            InlineKeyboardButton(text="✅ Да", callback_data="cancel_all_confirm"),
+            InlineKeyboardButton(text="❌ Нет", callback_data="cancel_all_cancel")
+        )
+        await callback.message.edit_text(
+            "⚠️ Вы уверены, что хотите отменить все pending заявки?",
+            reply_markup=kb.as_markup()
+        )
+        return
+
     logger.warning(f"Неизвестный callback: {data}")
 
 async def show_admin_order(message: Message, order_id: int):
@@ -757,7 +957,6 @@ async def process_admin_message_to_user(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("Выберите действие:", reply_markup=admin_main_keyboard())
 
-# ===================== ЗАПУСК =====================
 async def main():
     init_db()
     logger.info("Бот запущен")
