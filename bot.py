@@ -15,7 +15,7 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-BOT_TOKEN = "8643729424:AAEteJA_JHSm_H0T5r6UyJY3kI9hFhVUuxo"
+BOT_TOKEN = ""
 ADMIN_IDS = [5078387190, 119715930]
 
 BUY_PRICE = 25
